@@ -1,0 +1,61 @@
+app = "minecraft-on-demand-007a5d"
+primary_region = "sjc"
+
+kill_signal = "SIGTERM"
+kill_timeout = 120
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  EULA = "TRUE"
+  TYPE = "PAPER"
+  VERSION = "1.21.11"
+  PAPER_BUILD = "38"
+  MEMORY = "6G"
+  PRE_START_SCRIPT = "/usr/local/bin/import-server-data"
+  ENABLE_AUTOSTOP = "TRUE"
+  AUTOSTOP_TIMEOUT_INIT = "900"
+  AUTOSTOP_TIMEOUT_EST = "900"
+  AUTOSTOP_PERIOD = "10"
+  USE_AIKAR_FLAGS = "true"
+  ENABLE_ROLLING_LOGS = "true"
+
+[mounts]
+  source = "minecraft_data"
+  destination = "/data"
+  initial_size = "10gb"
+  snapshot_retention = 14
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 25565
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 25565
+
+  [services.concurrency]
+    type = "connections"
+    soft_limit = 20
+    hard_limit = 25
+
+[[services]]
+  protocol = "udp"
+  internal_port = 19132
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 19132
+
+[[restart]]
+  policy = "on-failure"
+  retries = 3
+
+[[vm]]
+  size = "performance-1x"
+  memory = "8gb"
