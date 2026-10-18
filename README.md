@@ -1,175 +1,237 @@
-# On-demand Paper server on Fly.io
+# On-demand Minecraft on Fly.io
 
-This project runs a small Paper server with Java and Bedrock cross-play that:
+Paper 1.21.11 with Java and Bedrock cross-play. The machine is **stopped until
+someone connects**, then it saves and powers itself off after 15 minutes empty.
 
-- starts for Java TCP 25565 or Bedrock UDP 19132 traffic;
-- stores the world on a persistent Fly Volume;
-- saves and stops 15 minutes after the last player leaves;
-- stays stopped after a clean idle shutdown.
+This is the config we run. Clone it, change the app name, deploy.
 
-## Expected resources and cost
+## How it wakes
 
-The Machine has 1 performance CPU and 8 GB RAM, with 6 GB assigned to
-Minecraft. CPU and RAM are billed only while the Machine runs. The 10 GB
-volume, stopped Machine root filesystem, snapshots, and dedicated IPv4 address
-continue to incur charges while it is stopped.
+Nothing custom is listening for players. Fly’s edge proxy already owns the
+public ports, even while the machine is off:
 
-Bedrock traffic requires a dedicated IPv4 address because Fly does not support
-public UDP over shared IPv4 or IPv6. Fly currently charges $2/month for a
-dedicated IPv4 address.
+| Players | Port | Protocol |
+| --- | --- | --- |
+| Java Edition | 25565 | TCP |
+| Bedrock Edition | 19132 | UDP |
 
-## 1. Install and authenticate flyctl
+`auto_start_machines = true` starts the Fly Machine when a packet hits either
+port. Paper and Geyser bind those same ports **inside** the VM after boot.
 
-Follow Fly's install instructions:
+Fly autostop is **off**. A game server has to `save` before it dies. The itzg
+image does that instead (`ENABLE_AUTOSTOP=TRUE`): 15 minutes with nobody online,
+then a clean Minecraft stop. Restart policy is `on-failure`, so a clean idle
+exit stays asleep.
+
+A whitelist blocks joining, not waking. Server-list pings and scanners can start
+the machine.
+
+Bedrock needs a **dedicated IPv4** ($2/mo). Fly cannot do public UDP on shared
+IPv4 or IPv6. Geyser must bind `fly-global-services`, not `0.0.0.0`.
+
+## Cost
+
+The machine is `performance-1x` with 8 GB RAM (6 GB heap) in `sjc`. CPU and RAM
+bill only while it runs. You still pay for:
+
+- 10 GB volume
+- stopped machine rootfs
+- volume snapshots (first 10 GB/month free)
+- dedicated IPv4
+
+Typical month is cheap if it only runs when people play. Always-on is ~$80+.
+
+## Setup
+
+### 1. Install flyctl and sign in
 
 https://fly.io/docs/flyctl/install/
-
-Then sign in:
 
 ```sh
 fly auth login
 ```
 
-## 2. Choose a region
+### 2. Name the app
 
-The configuration defaults to San Jose (`sjc`). Pick a region close to the
-players and change `primary_region` in `fly.toml` if needed:
+Fly app names are global. Edit `app` and `primary_region` in `fly.toml`. Pick a
+region close to the players:
 
 ```sh
 fly platform regions
 ```
 
-## 3. Create and deploy the app
-
-Fly app names are globally unique. Replace `YOUR_APP_NAME` in every command:
+### 3. Create, give it a public IPv4, deploy
 
 ```sh
 fly apps create YOUR_APP_NAME
 fly ips allocate-v4 -a YOUR_APP_NAME
-fly deploy --ha=false -a YOUR_APP_NAME
+fly deploy --ha=false
 ```
 
-The second command creates a billable dedicated IPv4 address. If every player
-has working IPv6, you can omit it and connect using the app's public IPv6
-address.
+`allocate-v4` is the billable dedicated IPv4 Bedrock needs. Skip it only if
+every player has working IPv6 and you will connect over IPv6.
 
-The first deploy creates one 10 GB volume named `minecraft_data`. Do not scale
-this app above one Machine: Minecraft world files are not safe for concurrent
-writes, and Fly Volumes attach to one Machine.
+The first deploy creates one 10 GB volume, `minecraft_data`. **Do not scale
+above one machine.** Minecraft worlds are not safe for concurrent writes, and a
+Fly volume attaches to one machine.
 
-## 4. Connect
+### 4. Connect
 
-Java Edition:
+Java:
 
 ```text
 YOUR_APP_NAME.fly.dev
 ```
 
-Bedrock Edition:
+Bedrock:
 
 ```text
 Address: YOUR_APP_NAME.fly.dev
 Port: 19132
 ```
 
-A cold start can take tens of seconds. The first connection may time out while
-the Machine and Paper start; retry after checking:
+Cold start takes tens of seconds. The first join often times out while Paper
+boots; retry, or watch:
 
 ```sh
 fly status -a YOUR_APP_NAME
 fly logs -a YOUR_APP_NAME
 ```
 
-## Administration
+### 5. Bedrock bind (required)
 
-Open the Paper console:
+On first boot Geyser writes `plugins/Geyser-Spigot/config.yml` with
+`address: 0.0.0.0`. Fly UDP will not reach that. SSH in after the first start
+and set:
+
+```yaml
+bedrock:
+  address: fly-global-services
+```
+
+Then `fly machine stop` (or let autostop fire) and join again.
+
+The image ships **Geyser** and **ViaVersion**. **Floodgate** is what lets
+Bedrock players in without a Java account. This live server got Floodgate from
+the migrated world. For a fresh server, drop `floodgate-spigot.jar` into
+`/plugins` (or add it to the Dockerfile) and restart.
+
+### 6. Lock it down
 
 ```sh
 fly ssh console -a YOUR_APP_NAME -C "rcon-cli"
 ```
 
-Useful console commands include `whitelist on`, `whitelist add PLAYER_NAME`,
-`op PLAYER_NAME`, `save-all flush`, and `stop`.
+Then: `whitelist on`, `whitelist add PLAYER`, `op PLAYER` as needed.
 
-Create an on-demand volume snapshot:
+## Import an existing world (optional)
 
-```sh
-fly volumes list -a YOUR_APP_NAME
-fly volumes snapshots create VOLUME_ID
-```
-
-Automatic snapshots are configured for 14-day retention. They are not a
-replacement for tested off-platform backups.
-
-## DigitalOcean Spaces backups
-
-`backup-server-data.sh` creates a consistent restic backup of the worlds,
-plugins, and server configuration in:
+`import-server-data.sh` runs once at boot if this file exists:
 
 ```text
-s3:https://tor1.digitaloceanspaces.com/minecraft-gredell/minecraft-paper-server
+/data/import/server-data.tar.gz
 ```
 
-The script disables saving, flushes the world, uploads directly from Fly,
-re-enables saving, and retains seven daily Fly snapshots. Credentials are Fly
-secrets and must not be committed to this repository.
+It checks a SHA-256, requires `world/level.dat`, `server.properties`, Geyser,
+and Floodgate, patches Geyser to `fly-global-services`, and moves the old Fly
+data aside.
 
-The separate Fly app `minecraft-backup-trigger-007a5d` contains a 256 MB
-scheduled Machine (`837057b7175738`). Once per approximate day, it wakes the
-existing Minecraft Machine, runs the backup over Fly SSH, and exits. It has no
-public service, volume, or Spaces credentials.
+For your own world:
 
-Fly anchors a daily schedule to its first run. This Machine was first started
-overnight on October 15, 2026 around 3:34 AM Pacific, so later runs should stay
-in the middle of the night. The time is approximate, not an exact clock. The
-old DigitalOcean timer is disabled and is not involved in backups.
+1. Tar the server directory (worlds, plugins, `server.properties`, etc.).
+2. Put the checksum of **your** archive into `import-server-data.sh`.
+3. Copy the tar onto the volume, for example with `fly sftp` or `fly ssh sftp`.
+4. Restart the machine so `PRE_START_SCRIPT` runs.
 
-Run and inspect backups manually:
+With no archive present, the script is a no-op and itzg generates a new world.
+
+## Nightly restic backups (optional)
+
+`backup-server-data.sh` lives **on the Minecraft machine**. It RCON `save-off`,
+flushes, uploads with restic, then `save-on`. Set these as secrets on the
+**Minecraft** app (never commit them):
 
 ```sh
-fly ssh console -a minecraft-on-demand-007a5d \
-  -C "/usr/local/bin/backup-server-data"
-fly ssh console -a minecraft-on-demand-007a5d \
-  -C "restic snapshots --host minecraft-on-demand-007a5d --tag minecraft-fly"
+fly secrets set -a YOUR_APP_NAME \
+  RESTIC_REPOSITORY='s3:https://REGION.digitaloceanspaces.com/BUCKET/path' \
+  RESTIC_PASSWORD='...' \
+  AWS_ACCESS_KEY_ID='...' \
+  AWS_SECRET_ACCESS_KEY='...'
 ```
 
-Restore into a temporary directory first; do not overwrite a running world:
+`RCON_PASSWORD` is already set by the itzg image. Point `RESTIC_REPOSITORY` at
+S3-compatible storage (this install uses DigitalOcean Spaces).
+
+A second tiny Fly app wakes the server on a daily schedule, SSHs in, runs the
+backup, and exits. It has no volume and no Spaces credentials.
 
 ```sh
-fly ssh console -a minecraft-on-demand-007a5d \
-  -C "restic restore latest --host minecraft-on-demand-007a5d \
-  --tag minecraft-fly --target /data/restore"
+fly apps create YOUR_BACKUP_APP
+fly secrets set -a YOUR_BACKUP_APP \
+  FLY_API_TOKEN="$(fly tokens create deploy -a YOUR_APP_NAME)" \
+  TARGET_APP=YOUR_APP_NAME \
+  TARGET_MACHINE="$(fly machines list -a YOUR_APP_NAME --json | jq -r '.[0].id')"
 ```
 
-## Migrated server data
-
-The server uses the migrated worlds and configuration from the previous host.
-Geyser, Floodgate, and ViaVersion provide Bedrock cross-play.
-
-Rollback copies are retained in two places:
-
-- the original server and `/root/minecraft-fly-migration.tar.gz` on the old host;
-- `/data/pre-import-backup-20261012T041913Z` on the Fly Volume.
-
-## Change the idle timeout or server version
-
-`AUTOSTOP_TIMEOUT_EST` is seconds after the last player disconnects.
-`AUTOSTOP_TIMEOUT_INIT` is seconds allowed for someone to join after startup.
-
-The server is pinned to Minecraft `1.21.11`, Paper build `38`. Before changing
-`VERSION` or `PAPER_BUILD` under `[env]` in `fly.toml`, take a snapshot.
-Minecraft world upgrades generally cannot be reversed.
-
-After configuration changes:
+From the repo root:
 
 ```sh
-fly deploy --ha=false -a YOUR_APP_NAME
+fly deploy -a YOUR_BACKUP_APP --ha=false \
+  --dockerfile backup-trigger/Dockerfile
 ```
 
-## On-demand caveats
+Then attach a daily schedule to that machine (Fly anchors the clock to the
+**first start**, not an exact crontab):
 
-- Any incoming connection can wake a public server, including status pings and
-  internet scanners. A whitelist controls joining but not waking.
-- Fly Volumes are tied to one physical host and do not replicate automatically.
-- The first client may need to reconnect after a cold start.
-- Controlled Fly shutdowns allow up to 120 seconds for the server to save.
+```sh
+fly machines list -a YOUR_BACKUP_APP
+fly machine update MACHINE_ID -a YOUR_BACKUP_APP --schedule daily
+```
+
+Start it once at the time of day you want backups (overnight, usually). Later
+runs stay near that time.
+
+Manual backup / list / restore (restore into a temp dir, never over a live
+world):
+
+```sh
+fly ssh console -a YOUR_APP_NAME -C "/usr/local/bin/backup-server-data"
+fly ssh console -a YOUR_APP_NAME \
+  -C "restic snapshots --host YOUR_APP_NAME --tag minecraft-fly"
+fly ssh console -a YOUR_APP_NAME \
+  -C "restic restore latest --host YOUR_APP_NAME --tag minecraft-fly --target /data/restore"
+```
+
+The backup script currently tags snapshots with host `minecraft-on-demand-007a5d`.
+Change those `--host` flags in `backup-server-data.sh` if your app name differs.
+
+## Version and idle timeout
+
+Pinned: Minecraft `1.21.11`, Paper build `38`. Snapshot the volume before
+changing `VERSION` or `PAPER_BUILD`. World upgrades generally cannot be reversed.
+
+| Env | Meaning |
+| --- | --- |
+| `AUTOSTOP_TIMEOUT_INIT` | Seconds to wait for the first join after boot (900) |
+| `AUTOSTOP_TIMEOUT_EST` | Seconds after the last player leaves (900) |
+
+```sh
+fly deploy --ha=false
+```
+
+## Layout
+
+| File | Role |
+| --- | --- |
+| `fly.toml` | Machine size, volume, TCP 25565, UDP 19132, autostart |
+| `Dockerfile` | itzg Paper, Geyser, ViaVersion, restic |
+| `import-server-data.sh` | One-time world import + Geyser UDP bind |
+| `backup-server-data.sh` | RCON flush + restic |
+| `backup-trigger/` | Daily machine that wakes the server and runs the backup |
+
+## Caveats
+
+- Any packet on 25565/19132 can wake a public server.
+- Fly volumes live on one host; they do not replicate.
+- The first client after a nap may need to reconnect.
+- Fly gives the process 120 seconds (`kill_timeout`) to save on a controlled stop.
